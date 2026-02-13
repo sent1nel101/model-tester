@@ -194,6 +194,9 @@ export function SingleTestPage() {
               text={stream.fullText}
               status={stream.status}
               error={stream.error}
+              usedFallback={stream.usedFallback}
+              onRetry={handleRun}
+              onCancel={stream.cancel}
             />
 
             <ResponseMetadata

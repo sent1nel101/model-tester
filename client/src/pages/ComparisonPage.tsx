@@ -15,6 +15,8 @@ import { useTestStore } from '../store/testStore';
 import { resolvePrompt, runAlgorithmicScoring, calculateTotalScore } from '../utils/scoring';
 import type { StreamStatus } from '../hooks/useStream';
 
+const CLIENT_TIMEOUT = 95_000;
+
 interface ModelStreamState {
   text: string;
   status: StreamStatus;
@@ -24,6 +26,7 @@ interface ModelStreamState {
   metricScores: MetricScore[];
   totalPercentage: number;
   isScoring: boolean;
+  usedFallback: boolean;
 }
 
 export function ComparisonPage() {
@@ -51,6 +54,28 @@ export function ComparisonPage() {
     }));
   };
 
+  const tryFallback = async (key: string, request: { provider: string; model: string; messages: ChatMessage[]; temperature: number; maxTokens: number }): Promise<string | null> => {
+    try {
+      updateModelState(key, { usedFallback: true, error: null });
+      const result = await api.chat(request);
+      updateModelState(key, {
+        text: result.content,
+        status: 'done',
+        latencyMs: result.latencyMs,
+        usage: result.usage,
+      });
+      return result.content;
+    } catch {
+      updateModelState(key, { usedFallback: false });
+      return null;
+    }
+  };
+
+  const cancelModel = (key: string) => {
+    abortRefs.current[key]?.abort();
+    updateModelState(key, { status: 'done' });
+  };
+
   const runSingleModel = async (model: ModelSelection, prompt: string, systemPrompt: string | undefined, vars: Record<string, string | number>) => {
     const key = `${model.provider}/${model.modelId}`;
     const abort = new AbortController();
@@ -59,47 +84,60 @@ export function ComparisonPage() {
     updateModelState(key, {
       text: '', status: 'streaming', error: null,
       latencyMs: 0, usage: { inputTokens: 0, outputTokens: 0 },
-      metricScores: [], totalPercentage: 0, isScoring: false,
+      metricScores: [], totalPercentage: 0, isScoring: false, usedFallback: false,
     });
 
     const messages: ChatMessage[] = [];
     if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
     messages.push({ role: 'user', content: prompt });
 
+    const chatRequest = {
+      provider: model.provider,
+      model: model.modelId,
+      messages,
+      temperature: Number(vars.temperature) ?? 0.7,
+      maxTokens: Number(vars.maxTokens) ?? 1024,
+    };
+
     let accumulated = '';
     const startTime = Date.now();
 
+    // Client-side timeout
+    const timeoutId = setTimeout(() => abort.abort(), CLIENT_TIMEOUT);
+
     try {
-      for await (const chunk of api.stream({
-        provider: model.provider,
-        model: model.modelId,
-        messages,
-        temperature: Number(vars.temperature) ?? 0.7,
-        maxTokens: Number(vars.maxTokens) ?? 1024,
-      }, abort.signal)) {
-        switch (chunk.type) {
-          case 'text':
-            accumulated += chunk.text || '';
-            updateModelState(key, { text: accumulated });
-            break;
-          case 'usage':
-            updateModelState(key, {
-              usage: {
-                inputTokens: chunk.inputTokens || 0,
-                outputTokens: chunk.outputTokens || 0,
-              },
-            });
-            break;
-          case 'done':
-            updateModelState(key, { status: 'done', latencyMs: chunk.latencyMs || Date.now() - startTime });
-            break;
-          case 'error':
-            updateModelState(key, { status: 'error', error: chunk.error || 'Unknown error' });
+      const result = await api.streamDirect(
+        chatRequest,
+        (update) => {
+          if (update.text !== undefined) {
+            accumulated = update.text;
+            updateModelState(key, { text: update.text });
+          }
+          if (update.usage) {
+            updateModelState(key, { usage: update.usage });
+          }
+        },
+        abort.signal,
+      );
+
+      clearTimeout(timeoutId);
+
+      if (result.error) {
+        if (!accumulated) {
+          const fallback = await tryFallback(key, chatRequest);
+          if (fallback) { accumulated = fallback; }
+          else {
+            updateModelState(key, { status: 'error', error: result.error });
             return;
+          }
+        } else {
+          updateModelState(key, { status: 'error', error: result.error });
+          return;
         }
       }
 
-      const latency = Date.now() - startTime;
+      accumulated = result.text || accumulated;
+      const latency = result.latencyMs || Date.now() - startTime;
       updateModelState(key, { status: 'done', latencyMs: latency });
 
       // Score the result
@@ -153,27 +191,62 @@ export function ComparisonPage() {
         }
       }
     } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        updateModelState(key, { status: 'error', error: err.message });
+      clearTimeout(timeoutId);
+      console.error(`[stream] ${key}:`, err.name, err.message);
+      if (err.name === 'AbortError') {
+        if (!accumulated && Date.now() - startTime >= CLIENT_TIMEOUT - 1000) {
+          const fallback = await tryFallback(key, chatRequest);
+          if (fallback) { accumulated = fallback; } else {
+            updateModelState(key, { status: 'error', error: 'Request timed out' });
+            return;
+          }
+        } else {
+          updateModelState(key, { status: 'done' });
+          return;
+        }
+      } else {
+        if (!accumulated) {
+          const fallback = await tryFallback(key, chatRequest);
+          if (fallback) { accumulated = fallback; } else {
+            updateModelState(key, { status: 'error', error: err.message });
+            return;
+          }
+        } else {
+          updateModelState(key, { status: 'error', error: err.message });
+          return;
+        }
       }
     }
   };
 
+  const getResolvedPrompts = useCallback(() => {
+    if (!scenario) return null;
+    const vars = getVarValues();
+    return {
+      vars,
+      prompt: resolvePrompt(scenario.prompt, vars),
+      system: scenario.systemPrompt ? resolvePrompt(scenario.systemPrompt, vars) : undefined,
+    };
+  }, [scenario, getVarValues]);
+
   const handleRunAll = useCallback(async () => {
     if (!scenario || store.selectedModels.length === 0) return;
+    const resolved = getResolvedPrompts();
+    if (!resolved) return;
 
     setModelStates({});
     setScores({});
 
-    const vars = getVarValues();
-    const resolvedPrompt = resolvePrompt(scenario.prompt, vars);
-    const resolvedSystem = scenario.systemPrompt ? resolvePrompt(scenario.systemPrompt, vars) : undefined;
-
-    // Run all models in parallel
     await Promise.allSettled(
-      store.selectedModels.map(model => runSingleModel(model, resolvedPrompt, resolvedSystem, vars))
+      store.selectedModels.map(model => runSingleModel(model, resolved.prompt, resolved.system, resolved.vars))
     );
-  }, [scenario, store.selectedModels, getVarValues]);
+  }, [scenario, store.selectedModels, getResolvedPrompts]);
+
+  const handleRetryModel = useCallback((model: ModelSelection) => {
+    const resolved = getResolvedPrompts();
+    if (!resolved) return;
+    runSingleModel(model, resolved.prompt, resolved.system, resolved.vars);
+  }, [getResolvedPrompts]);
 
   const isAnyRunning = Object.values(modelStates).some(s => s.status === 'streaming');
 
@@ -188,7 +261,8 @@ export function ComparisonPage() {
 
       {store.selectedCategoryId && (
         <>
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Row 1: Scenario + Model selection side by side */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <ScenarioSelector
               categoryId={store.selectedCategoryId}
               selectedId={store.selectedScenarioId}
@@ -196,34 +270,39 @@ export function ComparisonPage() {
             />
 
             {scenario && (
-              <>
-                <div className="space-y-4">
-                  <ModelSelector
-                    selected={store.selectedModels}
-                    onAdd={store.addModel}
-                    onRemove={store.removeModel}
-                    multi
-                  />
-                  <ParameterControls
-                    vars={scenario.configurableVars}
-                    values={store.parameterOverrides}
-                    onChange={store.setParameter}
-                  />
-                </div>
-
-                <PromptEditor
-                  prompt={scenario.prompt}
-                  systemPrompt={scenario.systemPrompt}
-                  vars={scenario.configurableVars}
-                  values={store.parameterOverrides}
-                  onChange={store.setParameter}
-                />
-              </>
+              <ModelSelector
+                selected={store.selectedModels}
+                onAdd={store.addModel}
+                onRemove={store.removeModel}
+                multi
+              />
             )}
           </div>
 
+          {/* Row 2: Parameters (temperature / max tokens) */}
+          {scenario && (
+            <ParameterControls
+              vars={scenario.configurableVars}
+              values={store.parameterOverrides}
+              onChange={store.setParameter}
+            />
+          )}
+
+          {/* Row 3: Scenario variables (left) + Prompt preview (right), full width */}
+          {scenario && (
+            <PromptEditor
+              prompt={scenario.prompt}
+              systemPrompt={scenario.systemPrompt}
+              vars={scenario.configurableVars}
+              values={store.parameterOverrides}
+              onChange={store.setParameter}
+              wideLayout
+            />
+          )}
+
           {scenario && (
             <button
+              type="button"
               onClick={handleRunAll}
               disabled={store.selectedModels.length === 0 || isAnyRunning}
               className="w-full py-3 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
@@ -247,7 +326,14 @@ export function ComparisonPage() {
                 return (
                   <div key={key} className="bg-gray-850 border border-gray-700 rounded-lg p-4 space-y-3">
                     <h3 className="text-sm font-medium text-indigo-400">{model.displayName}</h3>
-                    <StreamingOutput text={state.text} status={state.status} error={state.error} />
+                    <StreamingOutput
+                      text={state.text}
+                      status={state.status}
+                      error={state.error}
+                      usedFallback={state.usedFallback}
+                      onRetry={() => handleRetryModel(model)}
+                      onCancel={() => cancelModel(key)}
+                    />
                     <ResponseMetadata latencyMs={state.latencyMs} usage={state.usage} status={state.status} />
                     <ScoreCard metricScores={state.metricScores} totalPercentage={state.totalPercentage} isLoading={state.isScoring} />
                   </div>

@@ -2,8 +2,11 @@ import axios from 'axios';
 import type { ChatResponse, ModelInfo, StreamChunk } from '../../../shared/types.js';
 import { config } from '../config.js';
 import type { ProviderAdapter, ProviderChatRequest } from './types.js';
+import { readStreamError } from './util.js';
 
 const BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+const CONNECT_TIMEOUT = 15_000;
+const STREAM_IDLE_TIMEOUT = 60_000;
 
 export class GeminiProvider implements ProviderAdapter {
   name = 'gemini' as const;
@@ -57,6 +60,7 @@ export class GeminiProvider implements ProviderAdapter {
           'x-goog-api-key': config.geminiApiKey,
           'Content-Type': 'application/json',
         },
+        timeout: CONNECT_TIMEOUT,
       }
     );
 
@@ -80,54 +84,79 @@ export class GeminiProvider implements ProviderAdapter {
   async *stream(request: ProviderChatRequest): AsyncGenerator<StreamChunk> {
     const startTime = Date.now();
     const { contents, systemInstruction } = this.transformMessages(request.messages);
+    let response: any;
 
-    const response = await axios.post(
-      `${BASE_URL}/models/${request.model}:streamGenerateContent?alt=sse`,
-      {
-        contents,
-        systemInstruction,
-        generationConfig: {
-          temperature: request.temperature ?? 0.7,
-          maxOutputTokens: request.maxTokens ?? 1024,
+    try {
+      response = await axios.post(
+        `${BASE_URL}/models/${request.model}:streamGenerateContent?alt=sse`,
+        {
+          contents,
+          systemInstruction,
+          generationConfig: {
+            temperature: request.temperature ?? 0.7,
+            maxOutputTokens: request.maxTokens ?? 1024,
+          },
         },
-      },
-      {
-        headers: {
-          'x-goog-api-key': config.geminiApiKey,
-          'Content-Type': 'application/json',
-        },
-        responseType: 'stream',
-      }
-    );
+        {
+          headers: {
+            'x-goog-api-key': config.geminiApiKey,
+            'Content-Type': 'application/json',
+          },
+          responseType: 'stream',
+          timeout: CONNECT_TIMEOUT,
+        }
+      );
+    } catch (err: any) {
+      yield { type: 'error', error: await readStreamError(err, 'Gemini') };
+      return;
+    }
+
+    let idleTimer: ReturnType<typeof setTimeout> = undefined!;
+    const resetIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        try { response.data.destroy(); } catch {}
+      }, STREAM_IDLE_TIMEOUT);
+    };
+    resetIdle();
 
     let buffer = '';
-    for await (const chunk of response.data) {
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+    try {
+      for await (const chunk of response.data) {
+        resetIdle();
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const jsonStr = trimmed.slice(6);
-        try {
-          const parsed = JSON.parse(jsonStr);
-          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (text) {
-            yield { type: 'text', text };
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const jsonStr = trimmed.slice(6);
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (text) {
+              yield { type: 'text', text };
+            }
+            if (parsed.usageMetadata) {
+              yield {
+                type: 'usage',
+                inputTokens: parsed.usageMetadata.promptTokenCount || 0,
+                outputTokens: parsed.usageMetadata.candidatesTokenCount || 0,
+              };
+            }
+          } catch {
+            // Skip malformed JSON
           }
-          if (parsed.usageMetadata) {
-            yield {
-              type: 'usage',
-              inputTokens: parsed.usageMetadata.promptTokenCount || 0,
-              outputTokens: parsed.usageMetadata.candidatesTokenCount || 0,
-            };
-          }
-        } catch {
-          // Skip malformed JSON
         }
       }
+    } catch (err: any) {
+      clearTimeout(idleTimer);
+      yield { type: 'error', error: `Gemini stream interrupted: ${err.message}` };
+      return;
     }
+
+    clearTimeout(idleTimer);
     yield { type: 'done', latencyMs: Date.now() - startTime };
   }
 }

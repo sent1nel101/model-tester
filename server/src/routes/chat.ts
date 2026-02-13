@@ -22,9 +22,10 @@ router.post('/chat', async (req, res) => {
     const result = await provider.chat({ model, messages, temperature, maxTokens });
     res.json(result);
   } catch (err: any) {
-    console.error('Chat error:', err.response?.data || err.message);
     const status = err.response?.status || 500;
-    const message = err.response?.data?.error?.message || err.message || 'Internal server error';
+    const data = err.response?.data;
+    const message = data?.error?.message || data?.error || data?.message || err.message || 'Internal server error';
+    console.error(`Chat error [${req.body?.provider}/${req.body?.model}]:`, status, message);
     res.status(status).json({ error: message });
   }
 });

@@ -518,7 +518,7 @@ Topic: {{topic}}`,
         prompt: `Write a product description for {{product}} that:
 - Is exactly {{word_count}} words (+-5 words tolerance)
 - Does NOT use the words: {{banned_words}}
-- Mentions the price ${{price}} exactly once
+- Mentions the price \${{price}} exactly once
 - Includes exactly {{num_features}} bullet points for key features
 - Ends with a call to action`,
         expectedBehavior: 'Meets word count, avoids banned words, mentions price once, correct bullet count, ends with CTA.',
