@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.blackbox.ai)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(npm create:*)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx vite build)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial implementation of LLM Test Bench\n\nBrowser-based application for testing and comparing LLM capabilities\nacross Blackbox AI, Gemini, and Claude providers.\n\nFeatures:\n- React + Vite frontend with Tailwind CSS\n- Express backend proxy \\(API keys secured in .env\\)\n- 6 test categories with 17 pre-built scenarios\n- Single model testing with streaming output\n- Side-by-side multi-model comparison\n- Two-layer scoring: algorithmic checks + LLM-as-judge\n- Test history with localStorage persistence\n- Provider health monitoring dashboard\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(\"c:/Users/mytao/OneDrive/Desktop/practice/Post Grad Projects/AI Tool/Blackbox Test/server/src/routes/chat.ts\" << 'ENDOFFILE'\nimport { Router } from 'express';\nimport type { ChatRequest, ProviderName } from '../../../shared/types.js';\nimport { getProvider } from '../providers/index.js';\n\nconst router = Router\\(\\);\n\nrouter.post\\('/chat', async \\(req, res\\) => {\n  try {\n    const { provider: providerName, model, messages, temperature, maxTokens } = req.body as ChatRequest;\n\n    if \\(!providerName || !model || !messages?.length\\) {\n      res.status\\(400\\).json\\({ error: 'Missing required fields: provider, model, messages' }\\);\n      return;\n    }\n\n    const provider = getProvider\\(providerName as ProviderName\\);\n    if \\(!provider.isConfigured\\(\\)\\) {\n      res.status\\(400\\).json\\({ error: `Provider ${providerName} is not configured. Add its API key to .env` }\\);\n      return;\n    }\n\n    const result = await provider.chat\\({ model, messages, temperature, maxTokens }\\);\n    res.json\\(result\\);\n  } catch \\(err: any\\) {\n    const status = err.response?.status || 500;\n    const data = err.response?.data;\n    const message = data?.error?.message || data?.error || data?.message || err.message || 'Internal server error';\n    console.error\\(`Chat error [${req.body?.provider}/${req.body?.model}]:`, status, message\\);\n    res.status\\(status\\).json\\({ error: message }\\);\n  }\n}\\);\n\nexport default router;\nENDOFFILE)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
+    ]
+  }
+}
